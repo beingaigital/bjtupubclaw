@@ -1,0 +1,24 @@
+# Environment and IDE
+.env
+.cursor/
+.DS_Store
+.idea/
+.vscode/
+
+# Python bytecode
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Outputs
+output/
+output_langgraph/
+data_langgraph/
+
+# Logs
+*.log
+
+# Virtual environments
+.venv/
+venv/
+
