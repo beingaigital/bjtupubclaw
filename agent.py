@@ -4,6 +4,7 @@ import os
 import time
 import webbrowser
 import yaml
+import re
 from pathlib import Path
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Any, TypedDict, Annotated
@@ -244,22 +245,15 @@ def _is_docker_env() -> bool:
 class TrendState(TypedDict):
     """定义工作流状态"""
 
-    # 原始新闻数据
     news_data: Dict[str, Any]
-    # 原始抓取的新闻列表（用于并行节点合并）
     raw_items: Annotated[List[Dict[str, Any]], operator.add]
-    # 结构化分析结果
     analysis_result: Dict[str, Any]
-    # 十一类舆情分类统计结果
     classification_stats: Dict[str, Any]
-    # 论坛讨论内容
     forum_discussion: str
-    # 最终HTML报告
     html_report: str
-    # 执行过程中的消息记录（可选，用于调试）
     messages: Annotated[List[BaseMessage], operator.add]
-    # 错误信息
     error: Optional[str]
+    platform_summaries: Dict[str, Any]
 
 
 # === 节点定义 ===
@@ -293,8 +287,7 @@ class BaseFetchNode:
         try:
             data = json.loads(raw_data)
             raw_items = data.get("items", [])
-            # 为了提高样本量，这里尽量多保留一些热搜项（例如前 30 条）
-            top_items = raw_items[:30]
+            top_items = raw_items[:10]
             for idx, item in enumerate(top_items, 1):
                 items.append(
                     {
@@ -320,24 +313,20 @@ class BaseFetchNode:
         raw_data = self.fetch_data()
         if not raw_data:
             print(f"⚠️  警告: {self.platform_name} 抓取失败")
-            # 返回空列表，LangGraph会自动合并
             return {"raw_items": []}
 
         items = self.parse_data(raw_data)
         print(f"✅ {self.platform_name} 抓取完成，共 {len(items)} 条新闻")
 
-        # 保存到每小时数据目录
         try:
             save_path = save_hourly_data(self.platform_id, self.platform_name, items, timestamp)
             print(f"   数据已保存: {save_path}")
         except Exception as e:
             print(f"   保存数据失败: {e}")
 
-        # 返回抓取的数据（LangGraph会自动合并到raw_items）
         return {"raw_items": items}
 
 
-# 为每个平台创建Fetch节点
 class FetchWeiboNode(BaseFetchNode):
     def __init__(self):
         super().__init__("weibo", "微博")
@@ -435,8 +424,7 @@ class SpiderNode:
                 try:
                     data = json.loads(raw_data)
                     items = data.get("items", [])
-                    # 为了提高样本量，这里尽量多保留一些热搜项（例如前 30 条）
-                    top_items = items[:30]
+                    top_items = items[:10]
                     for idx, item in enumerate(top_items, 1):
                         news_list.append(
                             {
@@ -444,7 +432,6 @@ class SpiderNode:
                                 "source": source_name,
                                 "source_name": source_name,
                                 "title": item.get("title"),
-                                # 平台内排行（1 表示热搜第1）
                                 "rank": idx,
                                 "url": item.get("url", ""),
                                 "mobile_url": item.get("mobileUrl", ""),
@@ -459,7 +446,6 @@ class SpiderNode:
         if len(news_list) == 0:
             print("⚠️  警告: 未能抓取到任何新闻，可能是 API 服务问题或网络连接问题")
 
-        # 将本次抓取结果保存为快照，并合并最近 24 小时内的历史快照，扩大样本量
         try:
             snapshot_dir = Path("data_langgraph")
             ensure_directory_exists(str(snapshot_dir))
@@ -471,7 +457,6 @@ class SpiderNode:
         except Exception as e:
             print(f"保存快照失败: {e}")
 
-        # 合并最近 24 小时的快照
         aggregated: Dict[tuple, Dict[str, Any]] = {}
         now = get_beijing_time()
         lookback_hours = 24
@@ -497,7 +482,6 @@ class SpiderNode:
                         if existing is None:
                             aggregated[key] = dict(item)
                         else:
-                            # 保留更靠前的排名和更高的热度
                             rank_new = item.get("rank")
                             rank_old = existing.get("rank")
                             if rank_new is not None and (rank_old is None or rank_new < rank_old):
@@ -525,11 +509,7 @@ class NormalizeNewsNode:
         """清洗标题：去除多余空格、特殊字符等"""
         if not title:
             return ""
-        # 去除首尾空格
         title = title.strip()
-        # 去除多个连续空格
-        import re
-
         title = re.sub(r"\s+", " ", title)
         return title
 
@@ -538,7 +518,6 @@ class NormalizeNewsNode:
         if not raw_items:
             return []
 
-        # 1. 清洗：清理标题
         cleaned_items = []
         for item in raw_items:
             title = item.get("title", "")
@@ -548,12 +527,11 @@ class NormalizeNewsNode:
                 item_copy["title"] = cleaned_title
                 cleaned_items.append(item_copy)
 
-        # 2. 去重：基于 (source_id, title) 去重
         seen = {}
         deduplicated_items = []
         for item in cleaned_items:
             key = (item.get("source_id") or item.get("source") or "", item.get("title") or "")
-            if not key[1]:  # 标题为空则跳过
+            if not key[1]:
                 continue
 
             existing = seen.get(key)
@@ -561,7 +539,6 @@ class NormalizeNewsNode:
                 seen[key] = item
                 deduplicated_items.append(item)
             else:
-                # 保留更靠前的排名和更高的热度
                 rank_new = item.get("rank")
                 rank_old = existing.get("rank")
                 if rank_new is not None and (rank_old is None or rank_new < rank_old):
@@ -572,9 +549,20 @@ class NormalizeNewsNode:
                 if hot_new is not None and (hot_old is None or hot_new > hot_old):
                     existing["hot_value"] = hot_new
 
-        # 3. 排序：按平台权重和平台内排名排序
         platform_order = ["weibo", "baidu", "douyin", "zhihu", "toutiao", "tieba", "thepaper", "cls-hot", "ifeng", "wallstreetcn-hot"]
         platform_index = {pid: idx for idx, pid in enumerate(platform_order)}
+
+        platform_groups = {}
+        for item in deduplicated_items:
+            sid = item.get("source_id") or item.get("source") or "other"
+            if sid not in platform_groups:
+                platform_groups[sid] = []
+            platform_groups[sid].append(item)
+
+        final_items = []
+        for sid, items in platform_groups.items():
+            items.sort(key=lambda x: x.get("rank") or 9999)
+            final_items.extend(items[:10])
 
         def sort_key(item: Dict[str, Any]) -> tuple:
             source_id = item.get("source_id") or item.get("source") or "other"
@@ -582,27 +570,21 @@ class NormalizeNewsNode:
             item_rank = item.get("rank") or 9999
             return (platform_rank, item_rank)
 
-        sorted_items = sorted(deduplicated_items, key=sort_key)
-
+        sorted_items = sorted(final_items, key=sort_key)
         return sorted_items
 
     def __call__(self, state: TrendState) -> TrendState:
         """执行清洗、去重、排序"""
         print("--- [NormalizeNewsNode] 开始清洗、去重、排序 ---")
 
-        # 从状态中获取原始数据
         news_data = state.get("news_data", {})
         raw_items = news_data.get("raw_items", [])
 
-        # 加载过去12小时的历史数据
         print("正在加载过去12小时的历史数据...")
         historical_items = load_past_hours_data(lookback_hours=12)
         print(f"从历史数据中加载了 {len(historical_items)} 条新闻")
 
-        # 合并当前抓取的数据和历史数据
         all_items = raw_items + historical_items
-
-        # 执行清洗、去重、排序
         normalized_items = self.normalize_news(all_items)
 
         print(f"✅ 清洗、去重、排序完成，共 {len(normalized_items)} 条新闻")
@@ -611,30 +593,22 @@ class NormalizeNewsNode:
 
 
 class StartFetchNode:
-    """开始抓取的入口节点"""
-
     def __init__(self):
         pass
 
     def __call__(self, state: TrendState) -> TrendState:
-        """初始化抓取状态"""
         print("--- [StartFetchNode] 开始并行抓取所有平台 ---")
         return {"raw_items": []}
 
 
 class MergeFetchNode:
-    """合并所有Fetch节点的结果"""
-
     def __init__(self):
         pass
 
     def __call__(self, state: TrendState) -> TrendState:
-        """合并所有Fetch节点的结果"""
         print("--- [MergeFetchNode] 合并所有抓取结果 ---")
-        # raw_items已经通过Annotated自动合并了
         raw_items = state.get("raw_items", [])
         print(f"✅ 所有平台抓取完成，共 {len(raw_items)} 条原始新闻")
-        # 将raw_items转移到news_data中
         return {"news_data": {"raw_items": raw_items}}
 
 
@@ -656,51 +630,32 @@ class InsightNode:
             print("⚠️  警告: 没有新闻数据可分析，跳过分析步骤")
             return {"error": "No news to analyze", "analysis_result": {"top_topics": [], "summary": "今日无新闻数据"}}
 
-        # 优化1: 智能筛选新闻，减少输入量，避免触发API限制
-        # 优先选择：高排名、高热度、重要平台的新闻
         def news_priority_score(news_item: Dict[str, Any]) -> float:
-            """计算新闻优先级分数"""
             source_id = news_item.get("source_id", "").lower()
             rank = news_item.get("rank", 9999)
             hot_value = news_item.get("hot_value", 0)
 
-            # 平台权重（从高到低）
             platform_weights = {
-                "weibo": 10.0,
-                "baidu": 9.0,
-                "douyin": 8.0,
-                "zhihu": 7.0,
-                "toutiao": 6.0,
-                "tieba": 5.0,
-                "thepaper": 4.0,
-                "cls-hot": 3.0,
-                "ifeng": 2.0,
-                "wallstreetcn-hot": 1.0,
+                "weibo": 10.0, "baidu": 9.0, "douyin": 8.0, "zhihu": 7.0,
+                "toutiao": 6.0, "tieba": 5.0, "thepaper": 4.0, "cls-hot": 3.0,
+                "ifeng": 2.0, "wallstreetcn-hot": 1.0,
             }
             platform_weight = platform_weights.get(source_id, 0.5)
-
-            # 排名权重（排名越靠前分数越高）
             rank_weight = max(0, 30 - rank) / 30.0
-
-            # 热度权重（归一化到0-1）
             hot_weight = min(1.0, hot_value / 1000000.0) if hot_value else 0
 
-            # 综合分数
             score = platform_weight * 0.5 + rank_weight * 0.3 + hot_weight * 0.2
             return score
 
-        # 按优先级排序并限制数量（最多120条，避免输入过长）
         sorted_news = sorted(news_list, key=news_priority_score, reverse=True)
-        max_news_count = 120  # 限制新闻数量，减少输入长度
+        max_news_count = 120
         selected_news = sorted_news[:max_news_count]
 
         if len(news_list) > max_news_count:
             print(f"📊 从 {len(news_list)} 条新闻中筛选出前 {max_news_count} 条高优先级新闻进行分析")
 
-        # 优化2: 简化数据格式，只保留必要信息
-        news_text = "\n".join([f"- {n['title']}" for n in selected_news])  # 移除来源信息，减少字符数
+        news_text = "\n".join([f"- {n['title']}" for n in selected_news])
 
-        # 优化3: 简化Prompt，移除敏感关键词示例，使用更中性的表述
         system_prompt = "你是一个专业的舆情分析助手，擅长从新闻标题中提取热点事件并进行分类分析。"
         user_prompt = f"""
 请分析以下热点新闻标题列表，提取最重要的舆情事件：
@@ -731,31 +686,19 @@ class InsightNode:
 
         try:
             messages = [SystemMessage(content=system_prompt), HumanMessage(content=user_prompt)]
-
-            # 优化4: 添加小延迟，避免请求频率过高
             time.sleep(0.5)
-
             response = self.llm.invoke(messages)
             content = response.content
 
-            # 清理可能的 Markdown 标记
             json_str = content.replace("```json", "").replace("```", "").strip()
-
-            # 尝试解析JSON，如果失败则尝试修复不完整的JSON
             try:
                 analysis_result = json.loads(json_str)
             except json.JSONDecodeError as json_err:
-                # 尝试修复不完整的JSON
                 print(f"⚠️  JSON解析失败，尝试修复: {json_err}")
                 try:
-                    import re
-
-                    # 方法1: 尝试找到所有完整的topic对象（通过平衡大括号）
-                    # 查找 "top_topics": [ 之后的内容
                     topics_match = re.search(r'"top_topics"\s*:\s*\[', json_str)
                     if topics_match:
                         start_pos = topics_match.end()
-                        # 查找所有完整的topic对象
                         complete_objects = []
                         brace_count = 0
                         in_string = False
@@ -781,42 +724,33 @@ class InsightNode:
                                 elif char == "}":
                                     brace_count -= 1
                                     if brace_count == 0 and obj_start is not None:
-                                        # 找到了一个完整的对象
                                         complete_objects.append((obj_start, i + 1))
                                         obj_start = None
 
-                        # 如果找到了完整的对象，尝试构建有效的JSON
                         if complete_objects:
-                            # 提取所有完整对象的文本
                             obj_texts = [json_str[start:end] for start, end in complete_objects]
-                            # 构建有效的JSON
                             partial_json = '{"top_topics": [' + ",".join(obj_texts) + '], "summary": "JSON响应被截断，仅提取了部分数据"}'
                             try:
                                 analysis_result = json.loads(partial_json)
                                 print(f"⚠️  JSON被截断，已修复并提取了 {len(analysis_result.get('top_topics', []))} 个话题")
                             except Exception as parse_err:
-                                print(f"⚠️  修复后的JSON仍无法解析: {parse_err}")
                                 raise json_err
                         else:
                             raise json_err
                     else:
                         raise json_err
                 except Exception as fix_err:
-                    # 如果修复也失败，返回一个默认结构，但保留错误信息
                     print(f"⚠️  JSON解析失败且无法修复: {json_err}")
-                    # 尝试至少提取一些文本信息作为summary
                     summary_text = "分析过程中JSON响应被截断，无法完整解析"
                     if "summary" in json_str.lower():
                         summary_match = re.search(r'"summary"\s*:\s*"([^"]*)"', json_str)
                         if summary_match:
                             summary_text = summary_match.group(1) + " (部分数据)"
-
                     analysis_result = {"top_topics": [], "summary": summary_text}
 
             return {"analysis_result": analysis_result}
         except Exception as e:
             print(f"InsightNode Error: {e}")
-
             if "content" in locals():
                 return {"error": str(e), "analysis_result": {"raw": content}}
             else:
@@ -827,19 +761,9 @@ class ClassifyNode:
     """十一类舆情分类统计节点"""
 
     def __init__(self):
-        # 十一类舆情分类标准（采用《十大舆情分类》标准）
         self.category_order = [
-            "经济类舆论",
-            "突发事件舆论",
-            "法治类舆论",
-            "文娱类舆论",
-            "科教类舆论",
-            "国际关系类舆论",
-            "健康类舆论",
-            "治理类舆论",
-            "民生类舆论",
-            "生态环境类舆论",
-            "其他",
+            "经济类舆论", "突发事件舆论", "法治类舆论", "文娱类舆论", "科教类舆论",
+            "国际关系类舆论", "健康类舆论", "治理类舆论", "民生类舆论", "生态环境类舆论", "其他",
         ]
 
     def __call__(self, state: TrendState) -> TrendState:
@@ -848,7 +772,6 @@ class ClassifyNode:
         top_topics = analysis_result.get("top_topics") or []
 
         if not top_topics:
-            print("⚠️  警告: 没有分析结果可分类，跳过分类统计步骤")
             return {
                 "classification_stats": {
                     "topics_by_category": {c: [] for c in self.category_order},
@@ -857,7 +780,6 @@ class ClassifyNode:
                 }
             }
 
-        # 按类别对事件进行分组
         topics_by_category: Dict[str, List[Dict[str, Any]]] = {c: [] for c in self.category_order}
         for t in top_topics:
             cat = t.get("category") or "其他"
@@ -865,7 +787,6 @@ class ClassifyNode:
                 cat = "其他"
             topics_by_category[cat].append(t)
 
-        # 计算每个类别的最大舆情热度
         def _category_heat(cat: str) -> float:
             topics = topics_by_category.get(cat) or []
             max_heat = 0.0
@@ -879,12 +800,8 @@ class ClassifyNode:
             return max_heat
 
         category_heat_map = {cat: _category_heat(cat) for cat in self.category_order}
-
-        # 按类别的"最大舆情热度"从高到低排序，只展示有热点事件的类别
         category_display_order = [c for c in self.category_order if topics_by_category.get(c)]
         category_display_order.sort(key=lambda c: (-category_heat_map[c], self.category_order.index(c)))
-
-        print(f"分类统计完成，共 {len(category_display_order)} 个类别有热点事件")
 
         return {
             "classification_stats": {
@@ -915,8 +832,6 @@ class ForumNode:
             if len(analysis_result["top_topics"]) > 0:
                 topic = analysis_result["top_topics"][0].get("topic", "今日热点")
 
-        print(f"讨论话题: {topic}")
-
         prompt = ChatPromptTemplate.from_messages(
             [
                 (
@@ -945,8 +860,90 @@ class ForumNode:
             response = chain.invoke({"topic": topic})
             return {"forum_discussion": response.content}
         except Exception as e:
-            print(f"ForumNode Error: {e}")
             return {"forum_discussion": "讨论生成失败"}
+
+
+class PlatformSummaryNode:
+    """各平台关键词与精选评论生成节点（加强防报错版）"""
+
+    def __init__(self):
+        self.llm = ChatOpenAI(
+            api_key=os.environ.get("INSIGHT_ENGINE_API_KEY"),
+            base_url=os.environ.get("INSIGHT_ENGINE_BASE_URL", "https://api.siliconflow.cn/v1"),
+            model=os.environ.get("INSIGHT_ENGINE_MODEL_NAME", "Qwen/Qwen2.5-7B-Instruct"),
+            temperature=0.7,
+        )
+
+    def __call__(self, state: TrendState) -> TrendState:
+        print("--- [PlatformSummaryNode] 生成各平台关键词与精选评论 ---")
+        news_list = state.get("news_data", {}).get("news_list", [])
+        if not news_list:
+            return {"platform_summaries": {}}
+
+        # 分平台整理 Top 10 标题
+        platform_groups = {}
+        for item in news_list:
+            sid = item.get("source_id") or item.get("source") or "other"
+            if sid not in platform_groups:
+                platform_groups[sid] = []
+            if len(platform_groups[sid]) < 10:
+                platform_groups[sid].append(item.get("title", ""))
+
+        # 构建发给大模型的 Prompt
+        prompt_text = "请阅读以下各大平台的热搜榜单标题，为每个平台提取3个核心热点关键词，并模拟一条符合该平台网民风格的精选短评（15字左右，接地气、一针见血）。\n\n"
+        for sid, titles in platform_groups.items():
+            prompt_text += f"【平台ID: {sid}】\n"
+            for t in titles:
+                prompt_text += f"- {t}\n"
+            prompt_text += "\n"
+
+        prompt_text += """
+任务要求：
+1. 必须且只能输出 JSON 格式，不要包含任何前缀、后缀、或 markdown 代码块标记。
+2. JSON 的最外层 key 必须是上述提供的【平台ID】。
+3. 数据结构示例：
+{
+    "weibo": {
+        "keywords": ["关键词1", "关键词2", "关键词3"],
+        "comment": "这是一条模拟的精选评论"
+    },
+    "zhihu": {
+        "keywords": ["关键词A", "关键词B", "关键词C"],
+        "comment": "利益相关，简单分析一下背后的逻辑"
+    }
+}
+"""
+        
+        # 准备一个兜底数据结构，防止大模型API崩了导致UI显示不出来
+        fallback_data = {}
+        for sid in platform_groups.keys():
+            fallback_data[sid] = {
+                "keywords": ["分析中", "请稍候"],
+                "comment": "大模型暂未返回内容，请检查网络或API限流情况。"
+            }
+
+        try:
+            messages = [
+                SystemMessage(content="你是一个资深的互联网舆情编辑，必须严格输出纯 JSON 格式数据。"),
+                HumanMessage(content=prompt_text)
+            ]
+            response = self.llm.invoke(messages)
+            content = response.content
+            
+            # 使用强大的正则提取，防范大模型乱加标记
+            match = re.search(r'\{[\s\S]*\}', content)
+            if match:
+                clean_json_str = match.group(0)
+            else:
+                clean_json_str = content
+                
+            summaries = json.loads(clean_json_str)
+            print("✅ 关键词与评论生成成功")
+            return {"platform_summaries": summaries}
+            
+        except Exception as e:
+            print(f"⚠️ 生成各平台总结失败，已使用兜底数据。报错信息: {e}")
+            return {"platform_summaries": fallback_data}
 
 
 def render_langgraph_html_report(
@@ -954,6 +951,7 @@ def render_langgraph_html_report(
     analysis_result: Dict,
     forum_discussion: str,
     classification_stats: Optional[Dict[str, Any]] = None,
+    platform_summaries: Optional[Dict[str, Any]] = None,
 ) -> str:
     """使用与 main.py 一致的 HTML 模板生成舆情报告，保留来源与链接、支持保存为图片"""
     now = get_beijing_time()
@@ -962,24 +960,13 @@ def render_langgraph_html_report(
     top_topics = analysis_result.get("top_topics") or []
     summary = analysis_result.get("summary") or "暂无总结"
 
-    # 使用 ClassifyNode 生成的分类统计结果，如果没有则回退到原有逻辑
     if classification_stats:
         topics_by_category = classification_stats.get("topics_by_category", {})
         category_display_order = classification_stats.get("category_display_order", [])
     else:
-        # 回退逻辑：如果没有分类统计结果，则使用原有计算方式（保持向后兼容）
         category_order = [
-            "经济类舆论",
-            "突发事件舆论",
-            "法治类舆论",
-            "文娱类舆论",
-            "科教类舆论",
-            "国际关系类舆论",
-            "健康类舆论",
-            "治理类舆论",
-            "民生类舆论",
-            "生态环境类舆论",
-            "其他",
+            "经济类舆论", "突发事件舆论", "法治类舆论", "文娱类舆论", "科教类舆论", 
+            "国际关系类舆论", "健康类舆论", "治理类舆论", "民生类舆论", "生态环境类舆论", "其他"
         ]
         topics_by_category: Dict[str, List[Dict[str, Any]]] = {c: [] for c in category_order}
         for t in top_topics:
@@ -1003,23 +990,12 @@ def render_langgraph_html_report(
         category_display_order = [c for c in category_order if topics_by_category.get(c)]
         category_display_order.sort(key=lambda c: (-_category_heat(c), category_order.index(c)))
 
-    # 平台权重与排序（用于原始信息表格 & 热度理解）
-    # 这里假定配置中的 source_id 使用这些英文标识；若不匹配则自动归为“其他”
     platform_order = [
-        "weibo",  # 微博
-        "baidu-hot",  # 百度热搜（示例 ID，需与实际配置对应）
-        "douyin",  # 抖音
-        "zhihu",  # 知乎
-        "toutiao",  # 今日头条
-        "tieba",  # 贴吧
-        "thepaper",  # 澎湃新闻
-        "cls",  # 财联社热门
-        "ifeng",  # 凤凰网
-        "wallstreetcn",  # 华尔街见闻
+        "weibo", "baidu", "douyin", "zhihu", "toutiao", 
+        "tieba", "thepaper", "cls-hot", "ifeng", "wallstreetcn-hot"
     ]
     platform_index = {pid: idx for idx, pid in enumerate(platform_order)}
 
-    # 按来源分组新闻（同时保留 source_id，便于排序和权重）
     platforms: Dict[str, Dict[str, Any]] = {}
     for n in news_list:
         source_id = n.get("source_id") or n.get("source") or "other"
@@ -1033,54 +1009,58 @@ def render_langgraph_html_report(
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="color-scheme" content="light">
     <title>舆情日报 - 热点新闻分析</title>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js" integrity="sha512-BNaRQnYJYiPSqHHDb58B0yaPfCu+Wgds8Gp/gU33kqBtgNS4tSPHuGibyoeqMV/TJlSKda6FXzoEyYGjTe+vXA==" crossorigin="anonymous" referrerpolicy="no-referrer"></script>
     <style>
         * { box-sizing: border-box; }
-        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif; margin: 0; padding: 16px; background: #fafafa; color: #333; line-height: 1.5; }
-        .container { max-width: 600px; margin: 0 auto; background: white; border-radius: 12px; overflow: hidden; box-shadow: 0 2px 16px rgba(0,0,0,0.06); }
-        .header { background: linear-gradient(135deg, #4f46e5 0%, #7c3aed 100%); color: white; padding: 32px 24px; text-align: center; position: relative; }
+        :root { color-scheme: light; }
+        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif; margin: 0; padding: 16px; background: #f6f7fb; color: #111827; line-height: 1.5; }
+        .container { max-width: 720px; margin: 0 auto; background: #ffffff; border-radius: 12px; overflow: hidden; box-shadow: 0 2px 16px rgba(17,24,39,0.06); border: 1px solid #eef2f7; }
+        .header { background: #ffffff; color: #111827; padding: 24px 24px 20px; text-align: center; position: relative; border-bottom: 1px solid #eef2f7; }
         .save-buttons { position: absolute; top: 16px; right: 16px; display: flex; gap: 8px; }
-        .save-btn { background: rgba(255, 255, 255, 0.2); border: 1px solid rgba(255, 255, 255, 0.3); color: white; padding: 8px 16px; border-radius: 6px; cursor: pointer; font-size: 13px; font-weight: 500; transition: all 0.2s ease; backdrop-filter: blur(10px); white-space: nowrap; }
-        .save-btn:hover { background: rgba(255, 255, 255, 0.3); border-color: rgba(255, 255, 255, 0.5); transform: translateY(-1px); }
+        .save-btn { background: #ffffff; border: 1px solid #dbe3ee; color: #111827; padding: 8px 12px; border-radius: 8px; cursor: pointer; font-size: 13px; font-weight: 600; transition: all 0.2s ease; white-space: nowrap; box-shadow: 0 1px 2px rgba(17,24,39,0.04); }
+        .save-btn:hover { background: #f8fafc; border-color: #cbd5e1; transform: translateY(-1px); }
         .save-btn:disabled { opacity: 0.6; cursor: not-allowed; }
-        .header-title { font-size: 22px; font-weight: 700; margin: 0 0 20px 0; }
-        .header-info { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; font-size: 14px; opacity: 0.95; }
+        .header-title { font-size: 22px; font-weight: 800; margin: 0 0 16px 0; letter-spacing: 0.2px; }
+        .header-info { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; font-size: 14px; opacity: 1; }
         .info-item { text-align: center; }
-        .info-label { display: block; font-size: 12px; opacity: 0.8; margin-bottom: 4px; }
+        .info-label { display: block; font-size: 12px; color: #6b7280; margin-bottom: 4px; }
         .info-value { font-weight: 600; font-size: 16px; }
         .content { padding: 24px; }
         .section { margin-bottom: 32px; }
         .section:last-child { margin-bottom: 0; }
-        .section-title { font-size: 16px; font-weight: 600; color: #1a1a1a; margin: 0 0 16px 0; padding-bottom: 8px; border-bottom: 1px solid #f0f0f0; }
+        .section-title { font-size: 16px; font-weight: 800; color: #111827; margin: 0 0 16px 0; padding-bottom: 10px; border-bottom: 1px solid #eef2f7; }
         .section-body { font-size: 14px; color: #374151; line-height: 1.6; white-space: pre-wrap; }
         .topic-category { margin-bottom: 18px; font-size: 14px; font-weight: 600; color: #4b5563; }
-        .topic-item { margin-bottom: 16px; padding: 12px; background: #f8fafc; border-radius: 8px; border-left: 4px solid #4f46e5; }
+        .topic-item { margin-bottom: 16px; padding: 12px; background: #f8fafc; border-radius: 10px; border: 1px solid #eef2f7; border-left: 4px solid #2563eb; }
         .topic-name { font-weight: 600; color: #1e293b; margin-bottom: 4px; }
         .topic-meta { font-size: 12px; color: #64748b; margin-bottom: 6px; }
         .topic-comment { font-size: 13px; color: #475569; }
-        .source-group { margin-bottom: 24px; }
-        .source-title { color: #666; font-size: 13px; font-weight: 600; margin: 0 0 12px 0; padding-bottom: 6px; border-bottom: 1px solid #f5f5f5; }
-        .news-item { margin-bottom: 16px; padding: 12px 0; border-bottom: 1px solid #f5f5f5; display: flex; gap: 12px; align-items: flex-start; }
-        .news-item:last-child { border-bottom: none; }
-        .news-num { color: #999; font-size: 12px; font-weight: 600; min-width: 20px; text-align: center; flex-shrink: 0; background: #f1f5f9; border-radius: 50%; width: 22px; height: 22px; display: flex; align-items: center; justify-content: center; }
-        .news-content { flex: 1; min-width: 0; }
-        .news-link { color: #2563eb; text-decoration: none; }
-        .news-link:hover { text-decoration: underline; }
-        .news-link:visited { color: #7c3aed; }
-        .news-source { color: #666; font-size: 12px; margin-bottom: 4px; }
-        .news-hot { font-size: 11px; color: #dc2626; font-weight: 500; }
-        .raw-table-wrapper { overflow-x: auto; }
-        .raw-table { width: 100%; border-collapse: collapse; font-size: 13px; }
-        .raw-table thead { background: #f1f5f9; }
-        .raw-table th, .raw-table td { padding: 8px 10px; border-bottom: 1px solid #e5e7eb; text-align: left; }
-        .raw-table th { color: #4b5563; font-weight: 600; font-size: 12px; }
-        .raw-table tbody tr:hover { background: #f9fafb; }
-        .raw-table .platform-cell { white-space: nowrap; color: #374151; font-weight: 500; }
-        .raw-table .rank-cell { width: 60px; color: #6b7280; }
-        .raw-table .title-cell { color: #111827; }
-        .raw-table .hot-badge { margin-left: 6px; font-size: 11px; color: #b91c1c; }
-        .footer { margin-top: 24px; padding: 20px 24px; background: #f8f9fa; border-top: 1px solid #e5e7eb; text-align: center; }
+        
+        /* 卡片化新样式 */
+        .platform-cards { display: grid; gap: 16px; margin-top: 10px; }
+        .p-card { background: #fff; border: 1px solid #eef2f7; border-radius: 10px; overflow: hidden; box-shadow: 0 2px 8px rgba(17,24,39,0.04); }
+        .p-card-header { background: #f8fafc; padding: 12px 16px; font-weight: 800; border-bottom: 1px solid #eef2f7; color: #1e293b; font-size: 15px; }
+        
+        /* 新增：关键词和评论样式 */
+        .p-summary { background: #fdfdfd; padding: 12px 16px; border-bottom: 1px solid #eef2f7; font-size: 13px; color: #4b5563; }
+        .p-keywords { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 10px; }
+        .p-tag { background: #e0e7ff; color: #3730a3; padding: 4px 8px; border-radius: 6px; font-weight: 600; font-size: 12px; }
+        .p-comment { background: #f3f4f6; padding: 10px 12px; border-radius: 8px; font-style: italic; color: #374151; border-left: 4px solid #cbd5e1; line-height: 1.5; }
+        .p-comment::before { content: "💬 AI锐评："; font-weight: bold; font-style: normal; color: #64748b; }
+        
+        .p-list { list-style: none; margin: 0; padding: 0; }
+        .p-item { padding: 12px 16px; border-bottom: 1px solid #f1f5f9; display: flex; gap: 12px; align-items: flex-start; }
+        .p-item:hover { background: #f8fafc; }
+        .p-item:last-child { border-bottom: none; }
+        .p-rank { width: 26px; height: 26px; background: #eef2ff; color: #4f46e5; border-radius: 6px; display: flex; align-items: center; justify-content: center; font-size: 13px; font-weight: 800; flex-shrink: 0; }
+        .p-rank.top3 { background: #fee2e2; color: #dc2626; }
+        .p-title { font-size: 14px; color: #374151; text-decoration: none; line-height: 1.5; flex: 1; }
+        .p-title:hover { color: #2563eb; }
+        .hot-badge { font-size: 11px; color: #ef4444; background: #fef2f2; padding: 2px 6px; border-radius: 4px; margin-left: 6px; white-space: nowrap; display: inline-block; }
+        
+        .footer { margin-top: 24px; padding: 20px 24px; background: #f8fafc; border-top: 1px solid #eef2f7; text-align: center; }
         .footer-content { font-size: 13px; color: #6b7280; line-height: 1.6; }
         .project-name { font-weight: 600; color: #374151; }
         @media (max-width: 480px) { body { padding: 12px; } .header { padding: 24px 20px; } .content { padding: 20px; } .header-info { grid-template-columns: 1fr; } .save-buttons { position: static; margin-bottom: 16px; justify-content: center; flex-direction: column; width: 100%; } .save-btn { width: 100%; } }
@@ -1118,7 +1098,6 @@ def render_langgraph_html_report(
                 <div class="section-title">深度分析</div>
 """
 
-    # 按类别分组展示深度分析事件（类别按热度排序，只有有热点的类别才展示）
     for cat in category_display_order:
         cat_topics = topics_by_category.get(cat) or []
         html += '<div class="topic-category">' + html_escape(cat) + "</div>"
@@ -1146,61 +1125,70 @@ def render_langgraph_html_report(
     html += """</div>
             </div>
             <div class="section">
-                <div class="section-title">原始信息抓取（来源与链接）</div>
-                <div class="raw-table-wrapper">
-                    <table class="raw-table">
-                        <thead>
-                            <tr>
-                                <th>平台</th>
-                                <th>排行</th>
-                                <th>信息 & 链接</th>
-                            </tr>
-                        </thead>
-                        <tbody>
+                <div class="section-title">各平台热搜榜单 (Top 10)</div>
+                <div class="platform-cards">
 """
 
-    # 将所有新闻按平台顺序和平台内排行排序，生成统一列表
-    # 平台顺序：微博、百度热搜、抖音、知乎、今日头条、贴吧、澎湃新闻、财联社热门、凤凰网、华尔街见闻，其它平台排在最后
-    def _platform_sort_key(item: Dict[str, Any]) -> int:
-        sid = item.get("source_id") or item.get("source") or "other"
-        return platform_index.get(sid, len(platform_index))
-
-    rows: List[Dict[str, Any]] = []
-    for sid, info in platforms.items():
-        for n in info["items"]:
-            n_copy = dict(n)
-            # 确保包含 ID 与展示名
-            n_copy["source_id"] = sid
-            n_copy["source_name"] = info["name"]
-            rows.append(n_copy)
-
-    rows.sort(key=lambda n: (_platform_sort_key(n), n.get("rank") or 9999))
-
-    for n in rows:
-        platform_name = n.get("source_name") or n.get("source") or "其他"
-        rank = n.get("rank")
-        rank_text = str(rank) if rank is not None else "-"
-        title = n.get("title") or ""
-        link_url = n.get("mobile_url") or n.get("url") or ""
-        hot_val = n.get("hot_value")
-
-        html += "<tr>"
-        html += '<td class="platform-cell">' + html_escape(platform_name) + "</td>"
-        html += '<td class="rank-cell">' + html_escape(rank_text) + "</td>"
-        html += '<td class="title-cell">'
-        if link_url:
-            html += '<a href="' + html_escape(link_url) + '" target="_blank" class="news-link">' + html_escape(title) + "</a>"
-        else:
-            html += html_escape(title)
-        if hot_val is not None and hot_val != 0:
-            html += '<span class="hot-badge">热度 ' + html_escape(str(hot_val)) + "</span>"
-        html += "</td></tr>"
+    ordered_sids = sorted(platforms.keys(), key=lambda k: platform_index.get(k, 999))
+    
+    for sid in ordered_sids:
+        info = platforms[sid]
+        items = info["items"]
+        if not items:
+            continue
+            
+        items.sort(key=lambda x: x.get("rank") or 9999)
+        top_10_items = items[:10]
+        
+        html += f'<div class="p-card"><div class="p-card-header">📌 {html_escape(info["name"])}</div>'
+        
+        # --- 新增：在这里把大模型生成的关键词和评论插入到卡片顶部 ---
+        summary_data = (platform_summaries or {}).get(sid)
+        if summary_data:
+            keywords = summary_data.get("keywords", [])
+            comment = summary_data.get("comment", "")
+            if keywords or comment:
+                html += '<div class="p-summary">'
+                if keywords:
+                    html += '<div class="p-keywords">'
+                    for kw in keywords:
+                        html += f'<span class="p-tag">#{html_escape(str(kw))}</span>'
+                    html += '</div>'
+                if comment:
+                    html += f'<div class="p-comment">{html_escape(comment)}</div>'
+                html += '</div>'
+        # --------------------------------------------------------
+        
+        html += '<ul class="p-list">'
+        
+        for n in top_10_items:
+            rank = n.get("rank")
+            rank_text = str(rank) if rank is not None else "-"
+            top_class = " top3" if rank in [1, 2, 3] else ""
+            title = html_escape(n.get("title") or "")
+            link = html_escape(n.get("mobile_url") or n.get("url") or "")
+            hot_val = n.get("hot_value")
+            
+            html += f'<li class="p-item"><div class="p-rank{top_class}">{rank_text}</div>'
+            if link:
+                html += f'<a href="{link}" target="_blank" class="p-title">{title}'
+            else:
+                html += f'<span class="p-title">{title}'
+                
+            if hot_val is not None and hot_val != 0:
+                html += f'<span class="hot-badge">热度 {html_escape(str(hot_val))}</span>'
+                
+            if link:
+                html += '</a>'
+            else:
+                html += '</span>'
+                
+            html += '</li>'
+            
+        html += '</ul></div>'
 
     html += """
-                        </tbody>
-                    </table>
                 </div>
-            </div>
             </div>
         </div>
         <div class="footer">
@@ -1299,7 +1287,7 @@ def render_langgraph_html_report(
 
 
 class ReportNode:
-    """报告生成节点：使用与 main.py 一致的 HTML 模板，保留来源与链接，支持保存为图片与浏览器打开"""
+    """报告生成节点"""
 
     def __init__(self):
         pass
@@ -1310,10 +1298,12 @@ class ReportNode:
         news_data = state.get("news_data", {})
         discussion = state.get("forum_discussion", "")
         classification_stats = state.get("classification_stats")
+        
+        # --- 获取平台总结数据 ---
+        platform_summaries = state.get("platform_summaries", {})
 
         news_list = news_data.get("news_list") or []
 
-        # 修复：即使有错误，只要有新闻数据就生成报告
         if not news_list:
             print("⚠️  警告: 没有新闻数据，生成空报告")
             empty_html = """<!DOCTYPE html>
@@ -1342,7 +1332,8 @@ class ReportNode:
 </html>"""
             return {"html_report": empty_html}
 
-        html_content = render_langgraph_html_report(news_list, analysis_result, discussion, classification_stats)
+        # --- 把平台总结传入渲染函数 ---
+        html_content = render_langgraph_html_report(news_list, analysis_result, discussion, classification_stats, platform_summaries)
         return {"html_report": html_content}
 
 
@@ -1350,12 +1341,10 @@ class ReportNode:
 def build_graph():
     workflow = StateGraph(TrendState)
 
-    # 获取配置中的平台列表
     platforms = []
     if CONFIG and "platforms" in CONFIG:
         platforms = CONFIG["platforms"]
     else:
-        # 默认平台列表
         platforms = [
             {"id": "weibo", "name": "微博"},
             {"id": "zhihu", "name": "知乎"},
@@ -1370,7 +1359,6 @@ def build_graph():
             {"id": "wallstreetcn-hot", "name": "华尔街见闻"},
         ]
 
-    # 创建Fetch节点映射
     fetch_node_map = {
         "weibo": FetchWeiboNode,
         "zhihu": FetchZhihuNode,
@@ -1385,10 +1373,8 @@ def build_graph():
         "wallstreetcn-hot": FetchWallstreetcnNode,
     }
 
-    # 添加入口节点
     workflow.add_node("start_fetch", StartFetchNode())
 
-    # 添加Fetch节点（并行抓取）
     fetch_node_names = []
     for platform in platforms:
         platform_id = platform["id"]
@@ -1397,7 +1383,7 @@ def build_graph():
             fetch_node_names.append(node_name)
             workflow.add_node(node_name, fetch_node_map[platform_id]())
 
-    # 添加其他节点
+    workflow.add_node("platform_summary", PlatformSummaryNode())
     workflow.add_node("merge_fetch", MergeFetchNode())
     workflow.add_node("normalize", NormalizeNewsNode())
     workflow.add_node("insight", InsightNode())
@@ -1405,39 +1391,28 @@ def build_graph():
     workflow.add_node("forum", ForumNode())
     workflow.add_node("report", ReportNode())
 
-    # 定义边：所有Fetch节点从start_fetch开始，然后合并
     if fetch_node_names:
-        # 设置入口点
         workflow.set_entry_point("start_fetch")
-
-        # 所有Fetch节点都从start_fetch开始（这样可以并行执行）
         for node_name in fetch_node_names:
             workflow.add_edge("start_fetch", node_name)
-
-        # 所有Fetch节点都连接到merge_fetch
-        for node_name in fetch_node_names:
             workflow.add_edge(node_name, "merge_fetch")
-
-        # 合并后进入normalize
         workflow.add_edge("merge_fetch", "normalize")
     else:
-        # 如果没有配置平台，使用旧的SpiderNode作为后备
         workflow.add_node("spider", SpiderNode())
         workflow.set_entry_point("spider")
         workflow.add_edge("spider", "normalize")
 
-    # 后续流程
     workflow.add_edge("normalize", "insight")
     workflow.add_edge("insight", "classify")
     workflow.add_edge("classify", "forum")
-    workflow.add_edge("forum", "report")
+    workflow.add_edge("forum", "platform_summary")
+    workflow.add_edge("platform_summary", "report")
     workflow.add_edge("report", END)
 
     return workflow.compile()
 
 
 def run(config_path: Optional[str] = None) -> str:
-    """bjtupubclaw 入口：复用 trend_radar_langgraph.py 的完整效果，只做必要的配置路径与品牌名适配。"""
     global CONFIG
     if config_path:
         os.environ["CONFIG_PATH"] = config_path
@@ -1447,7 +1422,6 @@ def run(config_path: Optional[str] = None) -> str:
 
     app = build_graph()
 
-    # 初始状态
     initial_state: TrendState = {
         "messages": [],
         "news_data": {},
@@ -1457,6 +1431,7 @@ def run(config_path: Optional[str] = None) -> str:
         "forum_discussion": "",
         "html_report": "",
         "error": None,
+        "platform_summaries": {}, # --- 新增状态初始化 ---
     }
 
     final_state = app.invoke(initial_state)
@@ -1471,7 +1446,6 @@ def run(config_path: Optional[str] = None) -> str:
         with open(output_path, "w", encoding="utf-8") as f:
             f.write(final_state["html_report"])
 
-        # 同时写入 index.html，便于直接打开目录时查看最新报告
         index_path = output_dir / "index.html"
         with open(index_path, "w", encoding="utf-8") as f:
             f.write(final_state["html_report"])
@@ -1479,7 +1453,6 @@ def run(config_path: Optional[str] = None) -> str:
         report_path = str(output_path.resolve())
         print(f"\n✅ 流程执行成功！报告已保存: {report_path}")
 
-        # 非 Docker 环境下自动在浏览器中打开报告
         if not _is_docker_env():
             file_url = "file://" + report_path
             print(f"正在打开报告: {file_url}")
@@ -1496,17 +1469,13 @@ def run(config_path: Optional[str] = None) -> str:
     return report_path
 
 
-# === 主程序入口 ===
 def main():
     try:
         run()
     except Exception as e:
         print(f"\n❌ 流程执行异常: {e}")
         import traceback
-
         traceback.print_exc()
-
 
 if __name__ == "__main__":
     main()
-
