@@ -16,6 +16,9 @@ from langchain_openai import ChatOpenAI
 from langchain_core.prompts import ChatPromptTemplate
 from langgraph.graph import StateGraph, END
 
+# 📊 全局 CONFIG 变量，供 render_langgraph_html_report 使用
+CONFIG = None
+
 
 def load_env_file(env_path: Optional[str] = None) -> None:
     candidate_paths = []
@@ -117,6 +120,7 @@ def load_config():
 
 
 CONFIG = load_config()
+
 
 
 # === 基础工具函数 ===
@@ -962,6 +966,32 @@ def render_langgraph_html_report(
     top_topics = analysis_result.get("top_topics") or []
     summary = analysis_result.get("summary") or "暂无总结"
 
+    # 📊 读取对比模式配置
+    compare_mode_enabled = False
+    compare_platforms = []
+    compare_layout = "side-by-side"
+    compare_top_n = 20
+    
+    # 优先使用环境变量（命令行参数）
+    if os.environ.get("COMPARE_MODE", "").lower() == "true":
+        compare_mode_enabled = True
+        compare_platforms = [p.strip() for p in os.environ.get("COMPARE_PLATFORMS", "").split(",") if p.strip()]
+        compare_layout = os.environ.get("COMPARE_LAYOUT", "side-by-side")
+        try:
+            compare_top_n = int(os.environ.get("COMPARE_TOP_N", "20"))
+        except ValueError:
+            compare_top_n = 20
+    # 其次使用配置文件
+    elif CONFIG and CONFIG.get("compare_mode", {}).get("enabled"):
+        compare_mode_enabled = True
+        compare_platforms = CONFIG.get("compare_mode", {}).get("platforms", [])
+        compare_layout = CONFIG.get("compare_mode", {}).get("layout", "side-by-side")
+        compare_top_n = CONFIG.get("compare_mode", {}).get("top_n", 20)
+    
+    if compare_mode_enabled and compare_platforms:
+        print(f"📊 平台对比模式已启用：{', '.join(compare_platforms)}")
+        print(f"   布局：{compare_layout}, Top {compare_top_n}")
+
     # 使用 ClassifyNode 生成的分类统计结果，如果没有则回退到原有逻辑
     if classification_stats:
         topics_by_category = classification_stats.get("topics_by_category", {})
@@ -1028,22 +1058,82 @@ def render_langgraph_html_report(
             platforms[source_id] = {"name": source_name, "items": []}
         platforms[source_id]["items"].append(n)
 
+    # 📊 对比模式：过滤平台
+    if compare_mode_enabled and compare_platforms:
+        filtered_platforms = {}
+        for pid in compare_platforms:
+            if pid in platforms:
+                filtered_platforms[pid] = platforms[pid]
+        # 如果没有匹配的平台，保留所有平台（降级到普通模式）
+        if filtered_platforms:
+            platforms = filtered_platforms
+            print(f"   对比平台数：{len(platforms)}")
+
+    # 对比模式标题
+    compare_title = f"平台对比 ({len(platforms)})" if compare_mode_enabled and compare_platforms else "热点新闻分析"
+    
     html = """<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>舆情日报 - 热点新闻分析</title>
+    <title>舆情日报 - """ + html_escape(compare_title) + """</title>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js" integrity="sha512-BNaRQnYJYiPSqHHDb58B0yaPfCu+Wgds8Gp/gU33kqBtgNS4tSPHuGibyoeqMV/TJlSKda6FXzoEyYGjTe+vXA==" crossorigin="anonymous" referrerpolicy="no-referrer"></script>
     <style>
         * { box-sizing: border-box; }
         body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif; margin: 0; padding: 16px; background: #fafafa; color: #333; line-height: 1.5; }
         .container { max-width: 600px; margin: 0 auto; background: white; border-radius: 12px; overflow: hidden; box-shadow: 0 2px 16px rgba(0,0,0,0.06); }
         .header { background: linear-gradient(135deg, #4f46e5 0%, #7c3aed 100%); color: white; padding: 32px 24px; text-align: center; position: relative; }
+        .theme-toggle { position: absolute; top: 16px; left: 16px; background: rgba(255, 255, 255, 0.2); border: 1px solid rgba(255, 255, 255, 0.3); color: white; width: 40px; height: 40px; border-radius: 8px; cursor: pointer; font-size: 18px; transition: all 0.2s ease; backdrop-filter: blur(10px); display: flex; align-items: center; justify-content: center; }
+        .theme-toggle:hover { background: rgba(255, 255, 255, 0.3); transform: scale(1.1); }
         .save-buttons { position: absolute; top: 16px; right: 16px; display: flex; gap: 8px; }
         .save-btn { background: rgba(255, 255, 255, 0.2); border: 1px solid rgba(255, 255, 255, 0.3); color: white; padding: 8px 16px; border-radius: 6px; cursor: pointer; font-size: 13px; font-weight: 500; transition: all 0.2s ease; backdrop-filter: blur(10px); white-space: nowrap; }
         .save-btn:hover { background: rgba(255, 255, 255, 0.3); border-color: rgba(255, 255, 255, 0.5); transform: translateY(-1px); }
         .save-btn:disabled { opacity: 0.6; cursor: not-allowed; }
+        
+        /* 深色模式 */
+        .dark-mode { background: #0f172a; color: #e2e8f0; }
+        .dark-mode .container { background: #1e293b; box-shadow: 0 2px 16px rgba(0,0,0,0.3); }
+        .dark-mode .header { background: linear-gradient(135deg, #1e293b 0%, #334155 100%); border-bottom: 1px solid #374151; }
+        .dark-mode .header-info { opacity: 0.9; }
+        .dark-mode .info-label { color: #94a3b8; }
+        .dark-mode .info-value { color: #e2e8f0; }
+        .dark-mode .section-title { color: #e2e8f0; border-bottom-color: #374151; }
+        .dark-mode .section-body { color: #cbd5e1; }
+        .dark-mode .platform-save-tip { background: #334155; color: #94a3b8; }
+        .dark-mode .platform-card { background: #1e293b; border-color: #374151; box-shadow: 0 2px 8px rgba(0,0,0,0.3); }
+        .dark-mode .platform-card:hover { box-shadow: 0 4px 16px rgba(0,0,0,0.5); }
+        .dark-mode .platform-header { background: linear-gradient(135deg, #334155 0%, #475569 100%); border-bottom-color: #475569; }
+        .dark-mode .platform-name { color: #e2e8f0; }
+        .dark-mode .platform-count { background: #4f46e5; color: #e0e7ff; }
+        .dark-mode .platform-save-btn { background: #4f46e5; }
+        .dark-mode .platform-save-btn:hover { background: #6366f1; }
+        .dark-mode .news-item { border-bottom-color: #334155; }
+        .dark-mode .news-item:hover { background: #334155; }
+        .dark-mode .news-rank { background: #475569; color: #94a3b8; }
+        .dark-mode .news-link { color: #818cf8; }
+        .dark-mode .news-link:hover { color: #a5b4fc; }
+        .dark-mode .news-link:visited { color: #c4b5fd; }
+        .dark-mode .hot-badge { background: #451a1a; color: #fca5a5; }
+        .dark-mode .topic-item { background: #334155; border-left-color: #6366f1; }
+        .dark-mode .topic-name { color: #e2e8f0; }
+        .dark-mode .topic-meta { color: #94a3b8; }
+        .dark-mode .topic-comment { color: #cbd5e1; }
+        
+        /* 📊 平台对比模式样式 */
+        .compare-mode-indicator { position: absolute; top: 16px; left: 50%; transform: translateX(-50%); background: rgba(255, 255, 255, 0.2); backdrop-filter: blur(10px); padding: 6px 16px; border-radius: 20px; font-size: 13px; font-weight: 600; border: 1px solid rgba(255, 255, 255, 0.3); }
+        .compare-grid { display: grid; gap: 16px; }
+        .compare-grid.grid-2 { grid-template-columns: 1fr 1fr; }
+        .compare-grid.grid-3 { grid-template-columns: repeat(3, 1fr); }
+        .compare-side-by-side { display: flex; flex-direction: column; gap: 16px; }
+        .compare-tabs { margin-bottom: 16px; }
+        .compare-tab-buttons { display: flex; gap: 8px; border-bottom: 2px solid #e5e7eb; padding-bottom: 8px; margin-bottom: 16px; }
+        .compare-tab-btn { padding: 8px 16px; border: none; background: #f3f4f6; border-radius: 6px 6px 0 0; cursor: pointer; font-weight: 500; transition: all 0.2s; }
+        .compare-tab-btn:hover { background: #e5e7eb; }
+        .compare-tab-btn.active { background: #4f46e5; color: white; }
+        .compare-tab-content { display: none; }
+        .compare-tab-content.active { display: block; }
+        
         .header-title { font-size: 22px; font-weight: 700; margin: 0 0 20px 0; }
         .header-info { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; font-size: 14px; opacity: 0.95; }
         .info-item { text-align: center; }
@@ -1061,15 +1151,37 @@ def render_langgraph_html_report(
         .topic-comment { font-size: 13px; color: #475569; }
         .source-group { margin-bottom: 24px; }
         .source-title { color: #666; font-size: 13px; font-weight: 600; margin: 0 0 12px 0; padding-bottom: 6px; border-bottom: 1px solid #f5f5f5; }
-        .news-item { margin-bottom: 16px; padding: 12px 0; border-bottom: 1px solid #f5f5f5; display: flex; gap: 12px; align-items: flex-start; }
+        
+        /* 平台卡片样式 */
+        .platform-save-tip { font-size: 13px; color: #64748b; background: #f1f5f9; padding: 8px 16px; border-radius: 0 0 8px 8px; margin-bottom: 20px; }
+        .platform-card { margin-bottom: 24px; background: white; border-radius: 12px; overflow: hidden; box-shadow: 0 2px 8px rgba(0,0,0,0.08); border: 1px solid #e5e7eb; transition: all 0.2s ease; }
+        .platform-card:last-child { margin-bottom: 0; }
+        .platform-card:hover { box-shadow: 0 4px 16px rgba(0,0,0,0.12); transform: translateY(-2px); }
+        .platform-header { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 14px 18px; background: linear-gradient(135deg, #f8fafc 0%, #f1f5f9 100%); border-bottom: 1px solid #e5e7eb; }
+        .platform-left { display: flex; align-items: center; gap: 10px; flex: 1; }
+        .platform-icon { font-size: 18px; }
+        .platform-name { font-weight: 700; color: #1e293b; font-size: 15px; }
+        .platform-right { display: flex; align-items: center; gap: 10px; }
+        .platform-count { font-size: 12px; color: #64748b; background: #e0e7ff; padding: 3px 10px; border-radius: 12px; font-weight: 600; }
+        .platform-save-btn { background: #2563eb; color: white; border: none; border-radius: 6px; padding: 6px 10px; font-size: 14px; cursor: pointer; transition: all 0.2s; font-weight: 600; }
+        .platform-save-btn:hover { background: #1d4ed8; transform: scale(1.05); }
+        .platform-save-btn:active { transform: scale(0.95); }
+        .platform-news-list { padding: 8px 0; }
+        
+        .news-item { margin-bottom: 8px; padding: 12px 18px; border-bottom: 1px solid #f1f5f9; display: flex; gap: 12px; align-items: flex-start; transition: background 0.15s; }
+        .news-item:last-child { border-bottom: none; }
+        .news-item:hover { background: #f8fafc; }
+        .news-rank { font-size: 13px; font-weight: 700; color: #94a3b8; min-width: 32px; text-align: center; flex-shrink: 0; background: #f1f5f9; padding: 2px 6px; border-radius: 6px; }
+        .news-content { flex: 1; min-width: 0; display: flex; flex-wrap: wrap; gap: 8px; align-items: center; line-height: 1.4; }
         .news-item:last-child { border-bottom: none; }
         .news-num { color: #999; font-size: 12px; font-weight: 600; min-width: 20px; text-align: center; flex-shrink: 0; background: #f1f5f9; border-radius: 50%; width: 22px; height: 22px; display: flex; align-items: center; justify-content: center; }
         .news-content { flex: 1; min-width: 0; }
-        .news-link { color: #2563eb; text-decoration: none; }
-        .news-link:hover { text-decoration: underline; }
+        .news-link { color: #2563eb; text-decoration: none; font-weight: 500; }
+        .news-link:hover { text-decoration: underline; color: #1d4ed8; }
         .news-link:visited { color: #7c3aed; }
         .news-source { color: #666; font-size: 12px; margin-bottom: 4px; }
         .news-hot { font-size: 11px; color: #dc2626; font-weight: 500; }
+        .hot-badge { font-size: 11px; color: #dc2626; background: #fef2f2; padding: 2px 6px; border-radius: 4px; white-space: nowrap; }
         .raw-table-wrapper { overflow-x: auto; }
         .raw-table { width: 100%; border-collapse: collapse; font-size: 13px; }
         .raw-table thead { background: #f1f5f9; }
@@ -1083,17 +1195,24 @@ def render_langgraph_html_report(
         .footer { margin-top: 24px; padding: 20px 24px; background: #f8f9fa; border-top: 1px solid #e5e7eb; text-align: center; }
         .footer-content { font-size: 13px; color: #6b7280; line-height: 1.6; }
         .project-name { font-weight: 600; color: #374151; }
+        
+        /* 对比模式响应式 */
+        @media (max-width: 768px) {
+            .compare-grid.grid-2, .compare-grid.grid-3 { grid-template-columns: 1fr; }
+            .compare-mode-indicator { position: static; transform: none; display: inline-block; margin-bottom: 12px; }
+        }
         @media (max-width: 480px) { body { padding: 12px; } .header { padding: 24px 20px; } .content { padding: 20px; } .header-info { grid-template-columns: 1fr; } .save-buttons { position: static; margin-bottom: 16px; justify-content: center; flex-direction: column; width: 100%; } .save-btn { width: 100%; } }
     </style>
 </head>
 <body>
     <div class="container">
         <div class="header">
+            <button class="theme-toggle" onclick="toggleTheme()" title="切换深色/浅色模式">🌙</button>
             <div class="save-buttons">
                 <button class="save-btn" onclick="saveAsImage()">保存为图片</button>
                 <button class="save-btn" onclick="saveAsMultipleImages()">分段保存</button>
             </div>
-            <div class="header-title">舆情日报 · 热点新闻分析</div>
+            """ + (f'<div class="compare-mode-indicator">📊 平台对比模式：{", ".join([platforms.get(pid, {}).get("name", pid) for pid in compare_platforms])}</div>' if compare_mode_enabled and compare_platforms else '<div class="header-title">舆情日报 · 热点新闻分析</div>') + """
             <div class="header-info">
                 <div class="info-item"><span class="info-label">报告类型</span><span class="info-value">舆情分析</span></div>
                 <div class="info-item"><span class="info-label">新闻总数</span><span class="info-value">"""
@@ -1145,61 +1264,99 @@ def render_langgraph_html_report(
     html += html_escape(forum_discussion or "暂无重大事件剖析")
     html += """</div>
             </div>
-            <div class="section">
+            
+            <div class="section" id="platform-section">
                 <div class="section-title">原始信息抓取（来源与链接）</div>
-                <div class="raw-table-wrapper">
-                    <table class="raw-table">
-                        <thead>
-                            <tr>
-                                <th>平台</th>
-                                <th>排行</th>
-                                <th>信息 & 链接</th>
-                            </tr>
-                        </thead>
-                        <tbody>
+                <div class="platform-save-tip">💡 点击平台卡片右上角可单独保存该平台</div>
 """
 
-    # 将所有新闻按平台顺序和平台内排行排序，生成统一列表
-    # 平台顺序：微博、百度热搜、抖音、知乎、今日头条、贴吧、澎湃新闻、财联社热门、凤凰网、华尔街见闻，其它平台排在最后
-    def _platform_sort_key(item: Dict[str, Any]) -> int:
-        sid = item.get("source_id") or item.get("source") or "other"
+    # 对比模式：生成布局包装器开头
+    if compare_mode_enabled and compare_platforms and len(platforms) >= 2:
+        if compare_layout == "grid":
+            grid_class = "grid-3" if len(platforms) >= 3 else "grid-2"
+            html += f'<div class="compare-grid {grid_class}">'
+        elif compare_layout == "tabs":
+            html += '<div class="compare-tabs">'
+            html += '<div class="compare-tab-buttons">'
+            for idx, sid in enumerate(platforms.keys()):
+                platform_name = platforms[sid]["name"]
+                active = "active" if idx == 0 else ""
+                html += f'<button class="compare-tab-btn {active}" onclick="switchCompareTab(\'tab-{idx}\', event)">{html_escape(platform_name)}</button>'
+            html += '</div>'
+        else:  # side-by-side
+            html += '<div class="compare-side-by-side">'
+
+    # 按平台顺序排序
+    def _platform_sort_key(sid: str) -> int:
         return platform_index.get(sid, len(platform_index))
 
-    rows: List[Dict[str, Any]] = []
-    for sid, info in platforms.items():
-        for n in info["items"]:
-            n_copy = dict(n)
-            # 确保包含 ID 与展示名
-            n_copy["source_id"] = sid
-            n_copy["source_name"] = info["name"]
-            rows.append(n_copy)
+    sorted_platforms = sorted(platforms.keys(), key=_platform_sort_key)
 
-    rows.sort(key=lambda n: (_platform_sort_key(n), n.get("rank") or 9999))
+    # 按平台分组展示
+    for idx, sid in enumerate(sorted_platforms):
+        info = platforms[sid]
+        platform_name = info["name"]
+        items = info["items"]
+        platform_id = f"platform-{idx}"
+        
+        # 平台内按排行排序
+        items_sorted = sorted(items, key=lambda n: n.get("rank") or 9999)
+        
+        # Tabs 模式需要额外的 tab-content 包装器
+        tab_active = "active" if compare_mode_enabled and compare_layout == "tabs" and idx == 0 else ""
+        tab_wrapper_start = f'<div id="tab-{idx}" class="compare-tab-content {tab_active}">' if compare_mode_enabled and compare_layout == "tabs" else ''
+        tab_wrapper_end = '</div>' if compare_mode_enabled and compare_layout == "tabs" else ''
+        
+        html += tab_wrapper_start + f"""
+            <div class="platform-card" id="{platform_id}" data-platform="{html_escape(platform_name)}">
+                <div class="platform-header">
+                    <div class="platform-left">
+                        <span class="platform-icon">📱</span>
+                        <span class="platform-name">{html_escape(platform_name)}</span>
+                    </div>
+                    <div class="platform-right">
+                        <span class="platform-count">{len(items_sorted)} 条</span>
+                        <button class="platform-save-btn" onclick="saveSinglePlatform('{platform_id}', '{html_escape(platform_name)}')" title="保存该平台为图片">💾</button>
+                    </div>
+                </div>
+                <div class="platform-news-list">
+"""
+        
+        for i, n in enumerate(items_sorted, 1):
+            rank = n.get("rank")
+            rank_text = str(rank) if rank is not None else str(i)
+            title = n.get("title") or ""
+            link_url = n.get("mobile_url") or n.get("url") or ""
+            hot_val = n.get("hot_value")
+            
+            html += f"""
+                    <div class="news-item">
+                        <span class="news-rank">{rank_text}</span>
+                        <div class="news-content">
+"""
+            if link_url:
+                html += f'<a href="{html_escape(link_url)}" target="_blank" class="news-link">{html_escape(title)}</a>'
+            else:
+                html += html_escape(title)
+            
+            if hot_val is not None and hot_val != 0:
+                html += f'<span class="hot-badge">🔥 {hot_val}</span>'
+            
+            html += """
+                        </div>
+                    </div>
+"""
+        
+        html += """
+                </div>
+            </div>
+""" + tab_wrapper_end
 
-    for n in rows:
-        platform_name = n.get("source_name") or n.get("source") or "其他"
-        rank = n.get("rank")
-        rank_text = str(rank) if rank is not None else "-"
-        title = n.get("title") or ""
-        link_url = n.get("mobile_url") or n.get("url") or ""
-        hot_val = n.get("hot_value")
-
-        html += "<tr>"
-        html += '<td class="platform-cell">' + html_escape(platform_name) + "</td>"
-        html += '<td class="rank-cell">' + html_escape(rank_text) + "</td>"
-        html += '<td class="title-cell">'
-        if link_url:
-            html += '<a href="' + html_escape(link_url) + '" target="_blank" class="news-link">' + html_escape(title) + "</a>"
-        else:
-            html += html_escape(title)
-        if hot_val is not None and hot_val != 0:
-            html += '<span class="hot-badge">热度 ' + html_escape(str(hot_val)) + "</span>"
-        html += "</td></tr>"
+    # 对比模式：关闭布局包装器
+    if compare_mode_enabled and compare_platforms and len(platforms) >= 2:
+        html += '</div>'
 
     html += """
-                        </tbody>
-                    </table>
-                </div>
             </div>
             </div>
         </div>
@@ -1291,7 +1448,67 @@ def render_langgraph_html_report(
                 setTimeout(function(){ button.textContent = originalText; button.disabled = false; }, 2000);
             }
         }
-        document.addEventListener('DOMContentLoaded', function(){ window.scrollTo(0, 0); });
+        async function saveSinglePlatform(platformId, platformName) {
+            const platformCard = document.getElementById(platformId);
+            if (!platformCard) return;
+            
+            const scale = 2;
+            try {
+                const originalBg = platformCard.style.background;
+                platformCard.style.background = 'white';
+                
+                const canvas = await html2canvas(platformCard, { 
+                    backgroundColor: '#ffffff', 
+                    scale: scale, 
+                    useCORS: true, 
+                    logging: false 
+                });
+                
+                platformCard.style.background = originalBg;
+                
+                const now = new Date();
+                const base = 'BJTUPubClaw_' + platformName + '_' + now.getFullYear() + String(now.getMonth()+1).padStart(2,'0') + String(now.getDate()).padStart(2,'0') + '_' + String(now.getHours()).padStart(2,'0') + String(now.getMinutes()).padStart(2,'0');
+                
+                const a = document.createElement('a');
+                a.download = base + '.png';
+                a.href = canvas.toDataURL('image/png', 1.0);
+                document.body.appendChild(a);
+                a.click();
+                document.body.removeChild(a);
+            } catch (e) {
+                alert('保存失败：' + e.message);
+            }
+        }
+        function switchCompareTab(tabId, event) {
+            // 隐藏所有 tab 内容
+            const contents = document.querySelectorAll('.compare-tab-content');
+            contents.forEach(function(c) { c.classList.remove('active'); });
+            // 取消所有按钮激活状态
+            const buttons = document.querySelectorAll('.compare-tab-btn');
+            buttons.forEach(function(b) { b.classList.remove('active'); });
+            // 激活当前 tab
+            const targetTab = document.getElementById(tabId);
+            if (targetTab) targetTab.classList.add('active');
+            if (event && event.target) event.target.classList.add('active');
+        }
+        
+        function toggleTheme() {
+            document.body.classList.toggle('dark-mode');
+            const isDark = document.body.classList.contains('dark-mode');
+            const btn = document.querySelector('.theme-toggle');
+            if (btn) btn.textContent = isDark ? '☀️' : '🌙';
+            localStorage.setItem('pubclaw-theme', isDark ? 'dark' : 'light');
+        }
+        document.addEventListener('DOMContentLoaded', function(){ 
+            window.scrollTo(0, 0);
+            // 恢复用户主题偏好
+            const savedTheme = localStorage.getItem('pubclaw-theme');
+            if (savedTheme === 'dark') {
+                document.body.classList.add('dark-mode');
+                const btn = document.querySelector('.theme-toggle');
+                if (btn) btn.textContent = '☀️';
+            }
+        });
     </script>
 </body>
 </html>"""

@@ -8,6 +8,24 @@
 - 可选接入大模型，生成趋势总结、专题研判与论坛讨论
 - 一键生成自包含 HTML 报告（可直接打开或托管）
 - 留存数据快照，便于复盘与追踪
+- **📊 平台对比模式**：选择 2-3 个平台并排对比展示，支持三种布局方式
+
+## 📊 平台对比模式（新增！）
+
+快速对比不同平台的热点差异：
+
+```bash
+# 对比微博、知乎、抖音
+python3 main.py --compare weibo,zhihu,douyin
+
+# 使用网格布局
+python3 main.py --compare weibo,zhihu,douyin --layout grid
+
+# 使用标签页布局，显示 Top 10
+python3 main.py --compare weibo,zhihu,douyin --layout tabs --top-n 10
+```
+
+详细说明请查看 [COMPARE_MODE.md](COMPARE_MODE.md)
 
 ## 快速开始
 
@@ -83,9 +101,25 @@ python3 -m bjtupubclaw.main
 python3 -m bjtupubclaw.main --config /absolute/path/to/config.yaml
 ```
 
+运行方式 D：启用平台对比模式
+```bash
+# 对比微博、知乎、抖音（并排布局）
+python3 main.py --compare weibo,zhihu,douyin
+
+# 网格布局
+python3 main.py --compare weibo,zhihu,douyin --layout grid
+
+# 标签页布局
+python3 main.py --compare weibo,zhihu,douyin --layout tabs
+
+# 自定义显示条数
+python3 main.py --compare weibo,zhihu --top-n 10
+```
+
 说明：
 - 入口见 [main.py](file:///Users/biaowenhuang/Documents/bjtupubclaw/main.py)，内部调用了基于 LangGraph 的 [agent.py](file:///Users/biaowenhuang/Documents/bjtupubclaw/agent.py) 的 `run`。
 - 主要配置文件为 `config/config.yaml`，根目录的 `config.yaml` 内容与其保持一致，便于通过 `--config` 参数指定绝对路径。
+- 对比模式详细用法请查看 [COMPARE_MODE.md](COMPARE_MODE.md)
 
 
 ## 输出目录
